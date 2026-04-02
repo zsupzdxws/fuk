@@ -37,6 +37,7 @@ SUPPORT_USERNAME  = "@netflixgiveawayx"
 PROMO_CODES = {
     "VEDVIT":   1000000,
     "VEDVITOP": 1,
+    "TV": 2,
 }
 
 DEVICES = {
