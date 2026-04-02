@@ -23,10 +23,10 @@ NFTOKEN_API_KEY    = "NFK_dda3ee3932171d33d94067e3"
 API_URL            = "https://nftoken.site/v1/api.php"
 
 MUST_JOIN_CHANNELS = [
-    {"name": "Channel 1", "url": "https://t.me/netflixgiveawayx",       "id": "@netflixgiveawayx"},
-    {"name": "Channel 2", "url": "https://t.me/zwdxmoneymax",           "id": "@zwdxmoneymax"},
-    {"name": "Channel 3", "url": "https://t.me/RiyalLooters",           "id": "@RiyalLooters"},
-    {"name": "Channel 4", "url": "https://t.me/sheintrickss",           "id": "@sheintrickss"},
+    {"name": "Channel 1", "url": "https://t.me/netflixgiveawayx",  "id": "@netflixgiveawayx"},
+    {"name": "Channel 2", "url": "https://t.me/zwdxmoneymax",      "id": "@zwdxmoneymax"},
+    {"name": "Channel 3", "url": "https://t.me/RiyalLooters",      "id": "@RiyalLooters"},
+    {"name": "Channel 4", "url": "https://t.me/sheintrickss",      "id": "@sheintrickss"},
 ]
 
 STOCK_CHANNEL_ID  = -1003755778558
@@ -70,6 +70,68 @@ SUBMIT_FALLBACKS = [
 HEADLESS = True
 
 _pending_tv: dict = {}
+
+# ==========================================
+# PROXY ROTATION (TV LOGIN ONLY)
+# ==========================================
+# Format: ip:port:user:pass
+_RAW_PROXIES = [
+    "31.59.20.176:6754:sunyxylf:jcpmdb5nd5tu",
+    "23.95.150.145:6114:sunyxylf:jcpmdb5nd5tu",
+    "198.23.239.134:6540:sunyxylf:jcpmdb5nd5tu",
+    "45.38.107.97:6014:sunyxylf:jcpmdb5nd5tu",
+    "107.172.163.27:6543:sunyxylf:jcpmdb5nd5tu",
+    "198.105.121.200:6462:sunyxylf:jcpmdb5nd5tu",
+    "216.10.27.159:6837:sunyxylf:jcpmdb5nd5tu",
+    "142.111.67.146:5611:sunyxylf:jcpmdb5nd5tu",
+    "191.96.254.138:6185:sunyxylf:jcpmdb5nd5tu",
+    "31.58.9.4:6077:sunyxylf:jcpmdb5nd5tu",
+]
+
+def _parse_proxy(raw: str) -> dict | None:
+    """Parse ip:port:user:pass → playwright proxy dict."""
+    try:
+        ip, port, user, pwd = raw.strip().split(":")
+        return {
+            "server":   f"http://{ip}:{port}",
+            "username": user,
+            "password": pwd,
+        }
+    except Exception:
+        return None
+
+# Build ordered list of proxy dicts (index 0 = proxy 1, index 9 = proxy 10)
+_PROXY_LIST: list[dict] = [p for raw in _RAW_PROXIES if (p := _parse_proxy(raw))]
+
+# Shared rotating index — protected by a lock so concurrent TV sessions
+# don't both pick the same proxy
+_proxy_lock  = threading.Lock()
+_proxy_index = 0          # points to the NEXT proxy to use
+_dead_proxies: set = set()  # servers marked dead this session
+
+def _get_next_proxy() -> dict | None:
+    """
+    Returns proxies in order: 0→1→2→...→9→0→1→...
+    Skips proxies marked dead.
+    Returns None (direct/Railway IP) if ALL proxies are dead.
+    """
+    global _proxy_index
+    with _proxy_lock:
+        total = len(_PROXY_LIST)
+        for _ in range(total):          # at most one full cycle
+            proxy = _PROXY_LIST[_proxy_index % total]
+            _proxy_index = (_proxy_index + 1) % total
+            if proxy["server"] not in _dead_proxies:
+                return proxy
+        # every proxy is dead → fall back to direct
+        return None
+
+def _mark_proxy_dead(proxy: dict):
+    """Mark a proxy as dead so it is skipped for the rest of the session."""
+    if proxy:
+        _dead_proxies.add(proxy["server"])
+        print(f"[PROXY] Marked dead: {proxy['server']}  "
+              f"({len(_dead_proxies)}/{len(_PROXY_LIST)} dead)")
 
 # ==========================================
 # COOKIE FORMAT CONVERTER
@@ -153,19 +215,29 @@ def parse_cookies_for_playwright(raw: str) -> list[dict]:
 
 
 # ==========================================
-# PLAYWRIGHT TV AUTOMATION
+# PLAYWRIGHT TV AUTOMATION  (proxy-aware)
 # ==========================================
 
-async def _tv_activate_async(cookie_raw: str, code: str) -> tuple[bool, str]:
+async def _tv_activate_async(cookie_raw: str, code: str, proxy: dict | None) -> tuple[bool, str]:
+    """
+    Run Playwright TV activation.
+    proxy: playwright proxy dict  OR  None (use direct / Railway IP)
+    """
     cookies = parse_cookies_for_playwright(cookie_raw)
     if not cookies:
         raise ValueError("No valid cookies found in this slot.")
+
     screenshot_path = tempfile.mktemp(suffix=".png")
+
+    launch_kwargs = {
+        "headless": HEADLESS,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+    }
+    if proxy:
+        launch_kwargs["proxy"] = proxy
+
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=HEADLESS,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        browser = await pw.chromium.launch(**launch_kwargs)
         ctx = await browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent=(
@@ -178,6 +250,7 @@ async def _tv_activate_async(cookie_raw: str, code: str) -> tuple[bool, str]:
         try:
             await ctx.add_cookies(cookies)
             await page.goto(TV_URL, wait_until="networkidle", timeout=30_000)
+
             all_selectors = [CODE_SELECTOR] + CODE_FALLBACKS
             matched = None
             for sel in all_selectors:
@@ -187,9 +260,11 @@ async def _tv_activate_async(cookie_raw: str, code: str) -> tuple[bool, str]:
                     break
                 except Exception:
                     continue
+
             if not matched:
                 await page.screenshot(path=screenshot_path, full_page=False)
                 return False, screenshot_path
+
             inputs = await page.query_selector_all(matched)
             if len(inputs) > 1:
                 for i, digit in enumerate(code):
@@ -200,6 +275,7 @@ async def _tv_activate_async(cookie_raw: str, code: str) -> tuple[bool, str]:
             else:
                 await page.fill(matched, "")
                 await page.type(matched, code, delay=80)
+
             all_submit = [SUBMIT_SELECTOR] + SUBMIT_FALLBACKS
             submitted  = False
             for sel in all_submit:
@@ -212,21 +288,24 @@ async def _tv_activate_async(cookie_raw: str, code: str) -> tuple[bool, str]:
                     continue
             if not submitted:
                 await page.press(matched, "Enter")
+
             try:
                 await page.wait_for_load_state("networkidle", timeout=15_000)
             except Exception:
                 pass
+
             await page.screenshot(path=screenshot_path, full_page=False)
             return True, screenshot_path
+
         finally:
             await ctx.close()
             await browser.close()
 
 
-def tv_activate_sync(cookie_raw: str, code: str) -> tuple[bool, str]:
+def tv_activate_sync(cookie_raw: str, code: str, proxy: dict | None) -> tuple[bool, str]:
     loop = asyncio.new_event_loop()
     try:
-        return loop.run_until_complete(_tv_activate_async(cookie_raw, code))
+        return loop.run_until_complete(_tv_activate_async(cookie_raw, code, proxy))
     finally:
         loop.close()
 
@@ -723,7 +802,6 @@ def cb_redeem_device(call):
         )
         data = response.json()
         print(f"[REDEEM] status={data.get('status')} msg={data.get('message','')}")
-        print(f"[DEBUG] x_l1={data.get('x_l1','NONE')[:80]}")
 
         if data.get("status") == "SUCCESS":
             remaining_pts = deduct_points(uid, cost)
@@ -793,6 +871,7 @@ def handle_tv_code(message):
     if not code.isdigit() or len(code) != 8:
         bot.reply_to(message, "⚠️ Please send a valid *8-digit* numeric code.", parse_mode="Markdown")
         return
+
     session    = _pending_tv.pop(uid)
     cookie     = session["cookie"]
     status_msg = bot.reply_to(message, "🤖 Starting browser…")
@@ -806,9 +885,16 @@ def handle_tv_code(message):
         while attempt < MAX_TRIES:
             attempt += 1
             screenshot_path = None
+
+            # ── Pick the next proxy for this attempt ──────────────────────────
+            proxy = _get_next_proxy()
+            proxy_label = proxy["server"] if proxy else "direct (Railway IP)"
+            print(f"[TV] attempt={attempt}/{MAX_TRIES}  proxy={proxy_label}")
+
             try:
                 status_text = (
-                    "🍪 Injecting cookies…" if attempt == 1
+                    f"🍪 Injecting cookies… (proxy {attempt}/10)"
+                    if attempt == 1
                     else f"🔄 Trying another account (attempt {attempt}/{MAX_TRIES})…"
                 )
                 try:
@@ -816,7 +902,7 @@ def handle_tv_code(message):
                 except Exception:
                     pass
 
-                success, screenshot_path = tv_activate_sync(current_cookie, code)
+                success, screenshot_path = tv_activate_sync(current_cookie, code, proxy)
 
                 caption = (
                     f"✅ *TV Activation Successful!*\n\nCode `{code}` entered.\n"
@@ -839,7 +925,15 @@ def handle_tv_code(message):
                 return  # ✅ done
 
             except Exception as e:
-                print(f"[TV] Attempt {attempt}/{MAX_TRIES} failed: {e}")
+                err_str = str(e).lower()
+                print(f"[TV] attempt={attempt} proxy={proxy_label} error: {e}")
+
+                # Mark proxy dead if it's a connection/auth error
+                if proxy and any(k in err_str for k in (
+                    "proxy", "connect", "timeout", "refused", "407", "403", "ssl"
+                )):
+                    _mark_proxy_dead(proxy)
+
                 if screenshot_path and os.path.exists(screenshot_path):
                     try:
                         os.unlink(screenshot_path)
@@ -1100,5 +1194,6 @@ def fallback(message):
 # ==========================================
 if __name__ == "__main__":
     init_db()
+    print(f"[PROXY] Loaded {len(_PROXY_LIST)} proxies for TV login rotation.")
     print("🤖 Bot is running... Press Ctrl+C to stop.")
     bot.infinity_polling()
