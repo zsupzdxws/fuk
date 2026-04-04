@@ -305,7 +305,7 @@ def get_conn():
 
 # ── Schema version — bump only when adding NEW tables/columns,
 #    NEVER drop existing tables so user data survives restarts. ──
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 def _get_schema_version(conn) -> int:
     conn.execute("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)")
@@ -354,6 +354,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS promo_codes (
             code   TEXT PRIMARY KEY,
             points INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS referral_penalties (
+            referrer_uid  INTEGER NOT NULL,
+            referred_uid  INTEGER NOT NULL,
+            channel_id    TEXT    NOT NULL,
+            PRIMARY KEY (referrer_uid, referred_uid, channel_id)
         );
     """)
 
@@ -410,6 +416,46 @@ def add_referral(referrer_uid: int, new_uid: int) -> bool:
         return True
     except sqlite3.IntegrityError:
         return False
+
+def remove_referral(referrer_uid: int, referred_uid: int) -> bool:
+    """Remove referral link when referred user leaves a channel. Returns True if row existed."""
+    conn = get_conn()
+    cur = conn.execute(
+        "DELETE FROM referrals WHERE referrer_uid=? AND referred_uid=?",
+        (referrer_uid, referred_uid)
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+def get_referrer_of(uid: int):
+    """Return the referrer_uid for a given referred user, or None."""
+    row = get_conn().execute(
+        "SELECT referrer_uid FROM referrals WHERE referred_uid=?", (uid,)
+    ).fetchone()
+    return row[0] if row else None
+
+def has_penalty(referrer_uid: int, referred_uid: int, channel_id: str) -> bool:
+    return get_conn().execute(
+        "SELECT 1 FROM referral_penalties WHERE referrer_uid=? AND referred_uid=? AND channel_id=?",
+        (referrer_uid, referred_uid, channel_id)
+    ).fetchone() is not None
+
+def add_penalty(referrer_uid: int, referred_uid: int, channel_id: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO referral_penalties (referrer_uid, referred_uid, channel_id) VALUES (?,?,?)",
+        (referrer_uid, referred_uid, channel_id)
+    )
+    conn.commit()
+
+def remove_penalty(referrer_uid: int, referred_uid: int, channel_id: str):
+    """Clear a penalty when the user rejoins, so leaving again can penalise again."""
+    conn = get_conn()
+    conn.execute(
+        "DELETE FROM referral_penalties WHERE referrer_uid=? AND referred_uid=? AND channel_id=?",
+        (referrer_uid, referred_uid, channel_id)
+    )
+    conn.commit()
 
 def mark_joined(uid: int):
     _ensure_user(uid)
@@ -1348,10 +1394,95 @@ def fallback(message):
     )
 
 # ==========================================
+# CHAT MEMBER UPDATES — referral penalty
+# ==========================================
+# Requires the bot to be ADMIN in every MUST_JOIN_CHANNELS channel
+# so Telegram forwards chat_member updates to it.
+
+def _channel_id_str(chat_id) -> str:
+    """Normalise channel id to the same string stored in MUST_JOIN_CHANNELS."""
+    # Telegram sends numeric IDs in chat_member updates, e.g. -1001234567890
+    # MUST_JOIN_CHANNELS stores "@username" strings.
+    # We compare both formats.
+    return str(chat_id)
+
+def _is_must_join_channel(chat) -> bool:
+    for ch in MUST_JOIN_CHANNELS:
+        # match by numeric id or @username
+        if str(chat.id) in ch["id"] or ch["id"].lstrip("@") == (chat.username or ""):
+            return True
+    return False
+
+def _channel_key(chat) -> str:
+    """Stable string key for a channel, used as penalty channel_id."""
+    return str(chat.id)
+
+@bot.chat_member_handler()
+def on_chat_member_update(update: telebot.types.ChatMemberUpdated):
+    """
+    Fired when a user's membership in any chat the bot admins changes.
+    We only care about MUST_JOIN channels.
+    """
+    if not _is_must_join_channel(update.chat):
+        return
+
+    old_status = update.old_chat_member.status   # before
+    new_status = update.new_chat_member.status   # after
+    uid        = update.new_chat_member.user.id
+    ch_key     = _channel_key(update.chat)
+
+    left_statuses   = {"left", "kicked", "banned"}
+    joined_statuses = {"member", "administrator", "creator", "restricted"}
+
+    # ── User LEFT a required channel ──────────────────────────────────────────
+    if old_status in joined_statuses and new_status in left_statuses:
+        referrer_uid = get_referrer_of(uid)
+        if referrer_uid is None:
+            return  # not a referred user, nothing to do
+
+        # Only penalise once per (referrer, referred, channel) combination.
+        # This prevents repeat deductions if the user keeps leaving/rejoining.
+        if has_penalty(referrer_uid, uid, ch_key):
+            return
+
+        add_penalty(referrer_uid, uid, ch_key)
+        new_pts = deduct_points(referrer_uid, 1)
+        print(f"[PENALTY] uid={uid} left channel {ch_key} → referrer={referrer_uid} -1pt (bal={new_pts})")
+
+        try:
+            bot.send_message(
+                referrer_uid,
+                f"⚠️ *Referral Penalty!*\n\n"
+                f"A user you referred has left one of the required channels.\n"
+                f"➖ `1 pt` deducted.\n"
+                f"💎 Balance: `{new_pts} pts`",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+    # ── User REJOINED a required channel ─────────────────────────────────────
+    elif old_status in left_statuses and new_status in joined_statuses:
+        referrer_uid = get_referrer_of(uid)
+        if referrer_uid is None:
+            return
+
+        # Clear the penalty record so leaving again will penalise again
+        remove_penalty(referrer_uid, uid, ch_key)
+        print(f"[PENALTY] uid={uid} rejoined channel {ch_key} → penalty cleared for referrer={referrer_uid}")
+
+
+# ==========================================
 # ENTRY POINT
 # ==========================================
 if __name__ == "__main__":
     init_db()
     print(f"[PROXY] Loaded {len(_PROXY_LIST)} proxies for TV login rotation.")
     print("🤖 Bot is running... Press Ctrl+C to stop.")
-    bot.infinity_polling()
+    # chat_member updates must be explicitly requested
+    bot.infinity_polling(allowed_updates=[
+        "message",
+        "callback_query",
+        "channel_post",
+        "chat_member",
+    ])
